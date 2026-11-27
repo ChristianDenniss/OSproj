@@ -1,0 +1,8 @@
+webshell
+webshell-release
+*.o
+*.d
+access.log
+*.tar.gz
+tests/__pycache__/
+.local/
