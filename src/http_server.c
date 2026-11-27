@@ -1,21 +1,41 @@
 /*
- * CS 3404 Lab 07
+ * CS 3404 Capstone: webshell
  * Student: Christian Dennis
  * Student ID: 3729509
+ *
+ * Extends the Lab 07 poll(2) server with an explicit per-connection state
+ * machine, page-by-page streaming of file bodies, persistent and pipelined
+ * requests, and bounded per-iteration work so no client can starve others.
  */
 
 #define _POSIX_C_SOURCE 200809L
 #include "http_server.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
+#include <arpa/inet.h>
 #include <errno.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
+#include <fcntl.h>
 #include <poll.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+#define LISTEN_BACKLOG 128
+#define ACCEPT_BATCH 32
+#define PAGES_PER_DRIVE 16
+#define TRANSACTIONS_PER_DRIVE 16
+#define CLIENT_TIMEOUT_MS 30000
+#define ACCEPT_RETRY_MS 100
+#define POLL_TIMEOUT_MS 1000
+
+int64_t monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 int set_nonblocking(int fd)
 {
@@ -33,29 +53,87 @@ int set_nonblocking(int fd)
     return 0;
 }
 
+int set_cloexec(int fd)
+{
+    int flags = fcntl(fd, F_GETFD, 0);
+    if (flags == -1)
+    {
+        return -1;
+    }
+
+    if (fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == -1)
+    {
+        return -1;
+    }
+
+    return 0;
+}
+
+static void reset_response(client_conn_t *c)
+{
+    if (c->file_fd != -1)
+    {
+        close(c->file_fd);
+        c->file_fd = -1;
+    }
+    c->status = 0;
+    c->send_body = false;
+    c->hdr_len = 0;
+    c->hdr_sent = 0;
+    c->body_total = 0;
+    c->body_loaded = 0;
+    c->body_sent = 0;
+    c->stage_len = 0;
+    c->stage_sent = 0;
+}
+
+static void close_client(server_ctx_t *srv, client_conn_t *c)
+{
+    reset_response(c);
+    if (c->fd != -1)
+    {
+        close(c->fd);
+        c->fd = -1;
+        srv->active_clients--;
+    }
+    c->drive_pending = false;
+}
+
 int server_init(server_ctx_t *srv, uint16_t port, const char *doc_root)
 {
     memset(srv, 0, sizeof(*srv));
     srv->port = port;
     srv->doc_root = doc_root;
+    srv->listen_fd = -1;
+    srv->root_fd = -1;
 
     for (int i = 0; i < MAX_CLIENTS; i++)
     {
         srv->clients[i].fd = -1;
+        srv->clients[i].file_fd = -1;
+    }
+
+    srv->root_fd = open(doc_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (srv->root_fd < 0)
+    {
+        fprintf(stderr, "webshell: cannot open document root '%s': %s\n", doc_root, strerror(errno));
+        return -1;
     }
 
     srv->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (srv->listen_fd < 0)
     {
+        perror("webshell: socket");
+        server_close(srv);
         return -1;
     }
 
     int opt = 1;
     if (setsockopt(srv->listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0 ||
-        set_nonblocking(srv->listen_fd) < 0)
+        set_nonblocking(srv->listen_fd) < 0 || set_cloexec(srv->listen_fd) < 0)
     {
-        close(srv->listen_fd);
-        srv->listen_fd = -1;
+        perror("webshell: configure listening socket");
+        server_close(srv);
         return -1;
     }
 
@@ -67,368 +145,509 @@ int server_init(server_ctx_t *srv, uint16_t port, const char *doc_root)
 
     if (bind(srv->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
     {
-        close(srv->listen_fd);
-        srv->listen_fd = -1;
+        fprintf(stderr, "webshell: bind port %u: %s\n", port, strerror(errno));
+        server_close(srv);
         return -1;
     }
 
-    if (listen(srv->listen_fd, 128) < 0)
+    if (listen(srv->listen_fd, LISTEN_BACKLOG) < 0)
     {
-        close(srv->listen_fd);
-        srv->listen_fd = -1;
+        perror("webshell: listen");
+        server_close(srv);
         return -1;
     }
 
+    srv->start_ms = monotonic_ms();
     return 0;
 }
 
-int sanitize_url_path(const char *url_path, const char *doc_root, char *out_safe_path, size_t max_out)
+static void accept_clients(server_ctx_t *srv, int64_t now)
 {
-    if (url_path == NULL || url_path[0] != '/')
+    for (int n = 0; n < ACCEPT_BATCH && srv->active_clients < MAX_CLIENTS; n++)
     {
-        return -1;
-    }
+        struct sockaddr_in peer;
+        socklen_t peer_len = sizeof(peer);
+        int client_fd = accept(srv->listen_fd, (struct sockaddr *)&peer, &peer_len);
+        if (client_fd < 0)
+        {
+            if (errno == EINTR || errno == ECONNABORTED)
+            {
+                continue;
+            }
+            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM)
+            {
+                /* Out of descriptors: stop polling the listener briefly instead of spinning. */
+                srv->accept_resume_ms = now + ACCEPT_RETRY_MS;
+            }
+            else if (errno != EAGAIN && errno != EWOULDBLOCK)
+            {
+                perror("webshell: accept");
+            }
+            return;
+        }
 
-    if (strstr(url_path, "..") != NULL)
-    {
-        return -1;
-    }
+        if (set_nonblocking(client_fd) < 0 || set_cloexec(client_fd) < 0)
+        {
+            close(client_fd);
+            continue;
+        }
 
-    const char *target = strcmp(url_path, "/") == 0 ? "/index.html" : url_path;
-    int written = snprintf(out_safe_path, max_out, "%s%s", doc_root, target);
-    if (written < 0 || (size_t)written >= max_out)
-    {
-        return -1;
-    }
-
-    return 0;
-}
-
-int parse_http_request(client_conn_t *c)
-{
-    if (c->rx_len >= sizeof(c->rx_buf))
-    {
-        return -1;
-    }
-
-    c->rx_buf[c->rx_len] = '\0';
-    char *hdr_end = strstr(c->rx_buf, "\r\n\r\n");
-    if (!hdr_end)
-    {
-        c->request.parse_complete = false;
-        return 0;
-    }
-
-    char line[512];
-    char *first_line_end = strstr(c->rx_buf, "\r\n");
-    if (!first_line_end)
-    {
-        return -1;
-    }
-
-    size_t line_len = (size_t)(first_line_end - c->rx_buf);
-    if (line_len >= sizeof(line))
-    {
-        return -1;
-    }
-
-    memcpy(line, c->rx_buf, line_len);
-    line[line_len] = '\0';
-
-    char method_str[16];
-    char uri_str[MAX_PATH_LEN];
-    char ver_str[16];
-    if (sscanf(line, "%15s %511s %15s", method_str, uri_str, ver_str) != 3)
-    {
-        return -1;
-    }
-
-    if (strcmp(method_str, "GET") == 0)
-    {
-        c->request.method = HTTP_GET;
-    }
-    else if (strcmp(method_str, "HEAD") == 0)
-    {
-        c->request.method = HTTP_HEAD;
-    }
-    else
-    {
-        c->request.method = HTTP_UNSUPPORTED;
-    }
-
-    strcpy(c->request.path, uri_str);
-
-    c->request.keep_alive = true;
-    if (strcasestr(c->rx_buf, "Connection: close") != NULL)
-    {
-        c->request.keep_alive = false;
-    }
-
-    c->request.parse_complete = true;
-    return 1;
-}
-
-static void prepare_response(client_conn_t *c, const char *doc_root)
-{
-    c->tx_sent = 0;
-
-    if (c->request.method == HTTP_UNSUPPORTED)
-    {
-        const char *err405 = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 18\r\nConnection: close\r\n\r\nMethod Not Allowed";
-        c->tx_len = (size_t)snprintf(c->tx_buf, sizeof(c->tx_buf), "%s", err405);
-        c->request.keep_alive = false;
-        c->state = CONN_STATE_SENDING_RESP;
-        return;
-    }
-
-    char safe_path[MAX_PATH_LEN];
-    if (sanitize_url_path(c->request.path, doc_root, safe_path, sizeof(safe_path)) < 0)
-    {
-        const char *err403 = "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\nConnection: close\r\n\r\nForbidden";
-        c->tx_len = (size_t)snprintf(c->tx_buf, sizeof(c->tx_buf), "%s", err403);
-        c->request.keep_alive = false;
-        c->state = CONN_STATE_SENDING_RESP;
-        return;
-    }
-
-    FILE *f = fopen(safe_path, "rb");
-    if (!f)
-    {
-        const char *err404 = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-        c->tx_len = (size_t)snprintf(c->tx_buf, sizeof(c->tx_buf), "%s", err404);
-        c->request.keep_alive = false;
-        c->state = CONN_STATE_SENDING_RESP;
-        return;
-    }
-
-    long fsize = -1;
-    if (fseek(f, 0, SEEK_END) == 0)
-    {
-        fsize = ftell(f);
-    }
-
-    if (fsize >= 0 && fseek(f, 0, SEEK_SET) != 0)
-    {
-        fsize = -1;
-    }
-
-    const char *conn_hdr = c->request.keep_alive ? "keep-alive" : "close";
-    int hdr_len = -1;
-    if (fsize >= 0)
-    {
-        hdr_len = snprintf(c->tx_buf, sizeof(c->tx_buf),
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %ld\r\nConnection: %s\r\n\r\n",
-            fsize, conn_hdr);
-    }
-
-    if (hdr_len < 0 || (size_t)hdr_len >= sizeof(c->tx_buf) ||
-        (c->request.method == HTTP_GET && (unsigned long)fsize > sizeof(c->tx_buf) - (size_t)hdr_len))
-    {
-        fclose(f);
-        const char *err500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 14\r\nConnection: close\r\n\r\nFile too large";
-        c->tx_len = (size_t)snprintf(c->tx_buf, sizeof(c->tx_buf), "%s", err500);
-        c->request.keep_alive = false;
-        c->state = CONN_STATE_SENDING_RESP;
-        return;
-    }
-
-    size_t read_bytes = 0;
-    if (c->request.method == HTTP_GET)
-    {
-        read_bytes = fread(c->tx_buf + hdr_len, 1, (size_t)fsize, f);
-    }
-    fclose(f);
-
-    if (c->request.method == HTTP_GET && read_bytes != (size_t)fsize)
-    {
-        const char *err500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 14\r\nConnection: close\r\n\r\nFile too large";
-        c->tx_len = (size_t)snprintf(c->tx_buf, sizeof(c->tx_buf), "%s", err500);
-        c->request.keep_alive = false;
-        c->state = CONN_STATE_SENDING_RESP;
-        return;
-    }
-
-    c->tx_len = (size_t)hdr_len + read_bytes;
-    c->state = CONN_STATE_SENDING_RESP;
-}
-
-void server_run_event_loop(server_ctx_t *srv)
-{
-    struct pollfd fds[MAX_CLIENTS + 1];
-
-    while (1)
-    {
-        fds[0].fd = srv->listen_fd;
-        fds[0].events = POLLIN;
-        fds[0].revents = 0;
-        int nfds = 1;
-
-        int client_idx_map[MAX_CLIENTS + 1];
+        client_conn_t *c = NULL;
         for (int i = 0; i < MAX_CLIENTS; i++)
         {
-            if (srv->clients[i].fd != -1)
+            if (srv->clients[i].fd == -1)
             {
-                fds[nfds].fd = srv->clients[i].fd;
-                fds[nfds].events = srv->clients[i].state == CONN_STATE_READING_REQ ? POLLIN : POLLOUT;
-                fds[nfds].revents = 0;
-                client_idx_map[nfds] = i;
-                nfds++;
+                c = &srv->clients[i];
+                break;
             }
         }
 
-        int ready = poll(fds, (nfds_t)nfds, 1000);
+        memset(c, 0, sizeof(*c));
+        c->fd = client_fd;
+        c->file_fd = -1;
+        c->generation = ++srv->next_generation;
+        c->state = CONN_STATE_READING_REQ;
+        c->last_active_ms = now;
+        if (inet_ntop(AF_INET, &peer.sin_addr, c->peer_ip, sizeof(c->peer_ip)) == NULL)
+        {
+            strcpy(c->peer_ip, "-");
+        }
+        srv->active_clients++;
+    }
+}
+
+/* Sends buf[*sent..len). Returns 1 when finished, 0 on EAGAIN, -1 on error. */
+static int send_pending(server_ctx_t *srv, client_conn_t *c, const void *buf, size_t len, size_t *sent,
+                        int64_t now)
+{
+    while (*sent < len)
+    {
+        ssize_t n = send(c->fd, (const char *)buf + *sent, len - *sent, MSG_NOSIGNAL);
+        if (n > 0)
+        {
+            *sent += (size_t)n;
+            srv->bytes_sent += (uint64_t)n;
+            c->last_active_ms = now;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        {
+            srv->send_would_block++;
+            return 0;
+        }
+        return -1;
+    }
+    return 1;
+}
+
+static void start_error_response(client_conn_t *c, int status, bool keep_alive)
+{
+    reset_response(c);
+    c->status = status;
+    c->keep_alive = keep_alive;
+    c->send_body = c->request.method != HTTP_HEAD;
+
+    int body_len = snprintf((char *)c->stage, sizeof(c->stage), "%d %s\n", status, http_reason_phrase(status));
+    c->stage_len = (size_t)body_len;
+    c->body_total = (uint64_t)body_len;
+    c->body_loaded = (uint64_t)body_len;
+
+    int hdr_len = http_format_header(c->hdr_buf, sizeof(c->hdr_buf), status, "text/plain; charset=utf-8",
+                                     c->body_total, keep_alive);
+    c->hdr_len = hdr_len > 0 ? (size_t)hdr_len : 0;
+    c->state = CONN_STATE_SENDING_HEADERS;
+}
+
+static void start_response(server_ctx_t *srv, client_conn_t *c)
+{
+    http_request_t *req = &c->request;
+    if (req->method == HTTP_UNSUPPORTED)
+    {
+        start_error_response(c, 405, false);
+        return;
+    }
+
+    char path[MAX_PATH_LEN + 16];
+    int status = http_decode_path(req->target, path, sizeof(path));
+    if (status != 0)
+    {
+        start_error_response(c, status, req->keep_alive);
+        return;
+    }
+
+    int fd = -1;
+    struct stat st;
+    status = http_open_file(srv->root_fd, path, &fd, &st);
+    if (status != 0)
+    {
+        start_error_response(c, status, req->keep_alive);
+        return;
+    }
+
+    reset_response(c);
+    c->file_fd = fd;
+    c->status = 200;
+    c->keep_alive = req->keep_alive;
+    c->send_body = req->method == HTTP_GET;
+    c->body_total = (uint64_t)st.st_size;
+
+    int hdr_len = http_format_header(c->hdr_buf, sizeof(c->hdr_buf), 200, http_mime_type(path), c->body_total,
+                                     c->keep_alive);
+    if (hdr_len < 0)
+    {
+        start_error_response(c, 500, false);
+        return;
+    }
+    c->hdr_len = (size_t)hdr_len;
+    c->state = CONN_STATE_SENDING_HEADERS;
+}
+
+/* Fills the staging buffer with the next page of the file body. */
+static int load_next_page(client_conn_t *c)
+{
+    uint64_t remaining = c->body_total - c->body_loaded;
+    size_t want = remaining < WS_PAGE_SIZE ? (size_t)remaining : WS_PAGE_SIZE;
+    size_t got = 0;
+
+    while (got < want)
+    {
+        ssize_t n = pread(c->file_fd, c->stage + got, want - got, (off_t)(c->body_loaded + got));
+        if (n > 0)
+        {
+            got += (size_t)n;
+        }
+        else if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        else
+        {
+            /* Read error or the file shrank after the headers promised its length. */
+            return -1;
+        }
+    }
+
+    c->stage_len = got;
+    c->stage_sent = 0;
+    c->body_loaded += got;
+    return 0;
+}
+
+/* Returns true if the connection stays open for another request. */
+static bool finish_transaction(server_ctx_t *srv, client_conn_t *c)
+{
+    srv->requests_served++;
+    if (!c->keep_alive)
+    {
+        close_client(srv, c);
+        return false;
+    }
+
+    size_t consumed = c->request.header_len;
+    memmove(c->rx_buf, c->rx_buf + consumed, c->rx_len - consumed);
+    c->rx_len -= consumed;
+    reset_response(c);
+    c->state = CONN_STATE_READING_REQ;
+    return true;
+}
+
+/*
+ * Advances one connection as far as it can go without blocking. Called when
+ * its socket is readable or writable, and again later if it still has a
+ * buffered pipelined request after using up its per-call quota.
+ */
+static void client_drive(server_ctx_t *srv, client_conn_t *c, int64_t now)
+{
+    int pages = 0;
+    int transactions = 0;
+
+    for (;;)
+    {
+        switch (c->state)
+        {
+        case CONN_STATE_READING_REQ:
+        {
+            if (c->rx_len == 0)
+            {
+                return;
+            }
+            parse_result_t result = http_parse_request(c->rx_buf, c->rx_len, sizeof(c->rx_buf), &c->request);
+            if (result == PARSE_INCOMPLETE)
+            {
+                return;
+            }
+            if (result == PARSE_FAILED)
+            {
+                start_error_response(c, c->request.error_status, false);
+            }
+            else
+            {
+                start_response(srv, c);
+            }
+            break;
+        }
+
+        case CONN_STATE_SENDING_HEADERS:
+        {
+            int r = send_pending(srv, c, c->hdr_buf, c->hdr_len, &c->hdr_sent, now);
+            if (r < 0)
+            {
+                close_client(srv, c);
+                return;
+            }
+            if (r == 0)
+            {
+                return;
+            }
+            if (!c->send_body || c->body_total == 0)
+            {
+                if (!finish_transaction(srv, c))
+                {
+                    return;
+                }
+                if (++transactions >= TRANSACTIONS_PER_DRIVE)
+                {
+                    c->drive_pending = c->rx_len > 0;
+                    return;
+                }
+                break;
+            }
+            c->state = c->stage_len > 0 ? CONN_STATE_SENDING_BODY : CONN_STATE_WAIT_PAGE;
+            break;
+        }
+
+        case CONN_STATE_WAIT_PAGE:
+        {
+            if (load_next_page(c) < 0)
+            {
+                /* Headers are already out, so the only safe signal is closing. */
+                close_client(srv, c);
+                return;
+            }
+            c->state = CONN_STATE_SENDING_BODY;
+            if (++pages >= PAGES_PER_DRIVE)
+            {
+                return;
+            }
+            break;
+        }
+
+        case CONN_STATE_SENDING_BODY:
+        {
+            int r = send_pending(srv, c, c->stage, c->stage_len, &c->stage_sent, now);
+            if (r < 0)
+            {
+                close_client(srv, c);
+                return;
+            }
+            if (r == 0)
+            {
+                return;
+            }
+            c->body_sent += c->stage_len;
+            c->stage_len = 0;
+            c->stage_sent = 0;
+            if (c->body_sent < c->body_total)
+            {
+                c->state = CONN_STATE_WAIT_PAGE;
+                break;
+            }
+            if (!finish_transaction(srv, c))
+            {
+                return;
+            }
+            if (++transactions >= TRANSACTIONS_PER_DRIVE)
+            {
+                c->drive_pending = c->rx_len > 0;
+                return;
+            }
+            break;
+        }
+        }
+    }
+}
+
+static void handle_readable(server_ctx_t *srv, client_conn_t *c, int64_t now)
+{
+    size_t space = sizeof(c->rx_buf) - c->rx_len;
+    if (space == 0)
+    {
+        start_error_response(c, 431, false);
+        client_drive(srv, c, now);
+        return;
+    }
+
+    ssize_t n = recv(c->fd, c->rx_buf + c->rx_len, space, 0);
+    if (n > 0)
+    {
+        c->rx_len += (size_t)n;
+        c->last_active_ms = now;
+        client_drive(srv, c, now);
+    }
+    else if (n == 0)
+    {
+        close_client(srv, c);
+    }
+    else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+    {
+        close_client(srv, c);
+    }
+}
+
+static short client_poll_events(const client_conn_t *c)
+{
+    switch (c->state)
+    {
+    case CONN_STATE_READING_REQ:
+        return POLLIN;
+    case CONN_STATE_SENDING_HEADERS:
+    case CONN_STATE_SENDING_BODY:
+        return POLLOUT;
+    default:
+        return 0;
+    }
+}
+
+static void expire_idle_clients(server_ctx_t *srv, int64_t now)
+{
+    for (int i = 0; i < MAX_CLIENTS; i++)
+    {
+        client_conn_t *c = &srv->clients[i];
+        if (c->fd != -1 && now - c->last_active_ms >= CLIENT_TIMEOUT_MS)
+        {
+            close_client(srv, c);
+        }
+    }
+}
+
+int server_run_event_loop(server_ctx_t *srv, volatile sig_atomic_t *stop_flag)
+{
+    struct pollfd fds[MAX_CLIENTS + 1];
+    int slot_of[MAX_CLIENTS + 1];
+    uint32_t generation_of[MAX_CLIENTS + 1];
+
+    while (!*stop_flag)
+    {
+        int64_t now = monotonic_ms();
+        expire_idle_clients(srv, now);
+
+        nfds_t nfds = 0;
+        int listen_index = -1;
+        bool any_pending = false;
+        if (srv->active_clients < MAX_CLIENTS && now >= srv->accept_resume_ms)
+        {
+            fds[nfds].fd = srv->listen_fd;
+            fds[nfds].events = POLLIN;
+            fds[nfds].revents = 0;
+            listen_index = (int)nfds;
+            nfds++;
+        }
+
+        for (int i = 0; i < MAX_CLIENTS; i++)
+        {
+            client_conn_t *c = &srv->clients[i];
+            if (c->fd == -1)
+            {
+                continue;
+            }
+            fds[nfds].fd = c->fd;
+            fds[nfds].events = client_poll_events(c);
+            fds[nfds].revents = 0;
+            slot_of[nfds] = i;
+            generation_of[nfds] = c->generation;
+            nfds++;
+            any_pending = any_pending || c->drive_pending;
+        }
+
+        int timeout = any_pending ? 0 : POLL_TIMEOUT_MS;
+        if (listen_index < 0 && srv->accept_resume_ms > now && srv->accept_resume_ms - now < timeout)
+        {
+            timeout = (int)(srv->accept_resume_ms - now);
+        }
+
+        int ready = poll(fds, nfds, timeout);
         if (ready < 0)
         {
             if (errno == EINTR)
             {
                 continue;
             }
-            break;
+            perror("webshell: poll");
+            return -1;
         }
 
-        if (fds[0].revents & POLLIN)
+        now = monotonic_ms();
+        for (nfds_t j = 0; j < nfds; j++)
         {
-            while (1)
+            if ((int)j == listen_index)
             {
-                int client_fd = accept(srv->listen_fd, NULL, NULL);
-                if (client_fd < 0)
-                {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK)
-                    {
-                        break;
-                    }
-                    break;
-                }
-
-                if (set_nonblocking(client_fd) < 0)
-                {
-                    close(client_fd);
-                    continue;
-                }
-
-                int slot = -1;
-                for (int i = 0; i < MAX_CLIENTS; i++)
-                {
-                    if (srv->clients[i].fd == -1)
-                    {
-                        slot = i;
-                        break;
-                    }
-                }
-
-                if (slot != -1)
-                {
-                    memset(&srv->clients[slot], 0, sizeof(client_conn_t));
-                    srv->clients[slot].fd = client_fd;
-                    srv->clients[slot].state = CONN_STATE_READING_REQ;
-                }
-                else
-                {
-                    close(client_fd);
-                }
+                continue;
             }
-        }
-
-        for (int j = 1; j < nfds; j++)
-        {
-            int ci = client_idx_map[j];
-            client_conn_t *c = &srv->clients[ci];
-
-            if (c->fd == -1)
+            client_conn_t *c = &srv->clients[slot_of[j]];
+            short revents = fds[j].revents;
+            if (revents == 0 || c->fd == -1 || c->generation != generation_of[j])
             {
                 continue;
             }
 
-            if (fds[j].revents & (POLLERR | POLLNVAL))
+            if (revents & (POLLERR | POLLNVAL))
             {
-                close(c->fd);
-                c->fd = -1;
-                continue;
+                close_client(srv, c);
             }
+            else if ((revents & POLLIN) && c->state == CONN_STATE_READING_REQ)
+            {
+                handle_readable(srv, c, now);
+            }
+            else if ((revents & POLLOUT) && c->state != CONN_STATE_READING_REQ)
+            {
+                client_drive(srv, c, now);
+            }
+            else if (revents & POLLHUP)
+            {
+                close_client(srv, c);
+            }
+        }
 
-            if (fds[j].revents & POLLIN && c->state == CONN_STATE_READING_REQ)
+        for (int i = 0; i < MAX_CLIENTS; i++)
+        {
+            client_conn_t *c = &srv->clients[i];
+            if (c->fd != -1 && c->drive_pending)
             {
-                // Leave one byte for the null terminator used by the parser.
-                if (c->rx_len >= sizeof(c->rx_buf) - 1)
-                {
-                    close(c->fd);
-                    c->fd = -1;
-                    continue;
-                }
+                c->drive_pending = false;
+                client_drive(srv, c, now);
+            }
+        }
 
-                ssize_t n = recv(c->fd, c->rx_buf + c->rx_len, sizeof(c->rx_buf) - c->rx_len - 1, 0);
-                if (n > 0)
-                {
-                    c->rx_len += (size_t)n;
-                    int status = parse_http_request(c);
-                    if (status == 1)
-                    {
-                        prepare_response(c, srv->doc_root);
-                    }
-                    else if (status < 0)
-                    {
-                        close(c->fd);
-                        c->fd = -1;
-                    }
-                }
-                else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
-                {
-                    close(c->fd);
-                    c->fd = -1;
-                }
-            }
-            else if (fds[j].revents & POLLOUT && c->state == CONN_STATE_SENDING_RESP)
-            {
-                ssize_t n = send(c->fd, c->tx_buf + c->tx_sent, c->tx_len - c->tx_sent, 0);
-                if (n > 0)
-                {
-                    c->tx_sent += (size_t)n;
-                    if (c->tx_sent >= c->tx_len)
-                    {
-                        if (c->request.keep_alive)
-                        {
-                            c->state = CONN_STATE_READING_REQ;
-                            c->rx_len = 0;
-                            c->tx_len = 0;
-                            c->tx_sent = 0;
-                            memset(&c->request, 0, sizeof(c->request));
-                        }
-                        else
-                        {
-                            close(c->fd);
-                            c->fd = -1;
-                        }
-                    }
-                }
-                else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
-                {
-                    close(c->fd);
-                    c->fd = -1;
-                }
-            }
-            else if (fds[j].revents & POLLHUP)
-            {
-                close(c->fd);
-                c->fd = -1;
-            }
+        /* Accept last so new descriptors never collide with this round's poll entries. */
+        if (listen_index >= 0 && (fds[listen_index].revents & POLLIN))
+        {
+            accept_clients(srv, now);
         }
     }
+
+    return 0;
 }
 
 void server_close(server_ctx_t *srv)
 {
     for (int i = 0; i < MAX_CLIENTS; i++)
     {
-        if (srv->clients[i].fd != -1)
-        {
-            close(srv->clients[i].fd);
-            srv->clients[i].fd = -1;
-        }
+        close_client(srv, &srv->clients[i]);
     }
 
     if (srv->listen_fd != -1)
     {
         close(srv->listen_fd);
         srv->listen_fd = -1;
+    }
+
+    if (srv->root_fd != -1)
+    {
+        close(srv->root_fd);
+        srv->root_fd = -1;
     }
 }

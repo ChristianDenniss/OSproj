@@ -1,5 +1,6 @@
 webshell
 webshell-release
+build/
 *.o
 *.d
 access.log

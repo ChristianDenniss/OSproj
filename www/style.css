@@ -1,0 +1,12 @@
+body
+{
+    font-family: sans-serif;
+    margin: 2em;
+    max-width: 40em;
+}
+
+pre
+{
+    background: #f4f4f4;
+    padding: 1em;
+}

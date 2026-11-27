@@ -1,0 +1,6 @@
+{
+    "server": "webshell",
+    "course": "CS 3404",
+    "methods": ["GET", "HEAD"],
+    "page_size": 4096
+}
