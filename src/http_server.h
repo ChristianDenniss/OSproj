@@ -4,13 +4,16 @@
  * Student ID: 3729509
  *
  * Connection ownership and the poll(2) event loop. The event loop thread is
- * the only code that reads or writes client sockets or client_conn_t state.
+ * the only code that reads or writes client sockets, client_conn_t state,
+ * the page cache or the server counters.
  */
 
 #ifndef HTTP_SERVER_H
 #define HTTP_SERVER_H
 
+#include "cache.h"
 #include "http.h"
+#include "io_worker.h"
 
 #include <netinet/in.h>
 #include <signal.h>
@@ -19,20 +22,21 @@
 #include <stdint.h>
 
 #define MAX_CLIENTS 64
-#define WS_PAGE_SIZE 4096
 #define HDR_BUF_SIZE 512
 
 /*
  * Per-connection state machine:
  *
- *   READING_REQ -> SENDING_HEADERS -> [WAIT_PAGE <-> SENDING_BODY] -> READING_REQ
+ *   READING_REQ -> WAIT_FILE -> SENDING_HEADERS -> [WAIT_PAGE <-> SENDING_BODY] -> READING_REQ
  *
- * A connection that is not persistent is closed instead of returning to
- * READING_REQ. HEAD requests and empty bodies skip the body states.
+ * WAIT_FILE and WAIT_PAGE wait on the I/O worker (a cache hit skips the
+ * wait). A connection that is not persistent is closed instead of returning
+ * to READING_REQ. Errors and HEAD requests skip the states they do not need.
  */
 typedef enum
 {
     CONN_STATE_READING_REQ = 0,
+    CONN_STATE_WAIT_FILE,
     CONN_STATE_SENDING_HEADERS,
     CONN_STATE_WAIT_PAGE,
     CONN_STATE_SENDING_BODY
@@ -46,10 +50,13 @@ typedef struct
     char peer_ip[INET_ADDRSTRLEN];
     int64_t last_active_ms;
     bool drive_pending;
+    bool io_in_flight;
+    bool page_miss_pending;
 
     char rx_buf[REQ_BUF_SIZE];
     size_t rx_len;
     http_request_t request;
+    char path[DECODED_PATH_LEN];
 
     int status;
     bool keep_alive;
@@ -59,6 +66,7 @@ typedef struct
     size_t hdr_sent;
 
     int file_fd;
+    file_id_t file;
     uint64_t body_total;
     uint64_t body_loaded;
     uint64_t body_sent;
@@ -79,15 +87,21 @@ typedef struct
     int64_t start_ms;
     int64_t accept_resume_ms;
 
+    page_cache_t cache;
+    bool cache_ready;
+    io_worker_t worker;
+    bool worker_ready;
+
     uint64_t requests_served;
     uint64_t bytes_sent;
     uint64_t send_would_block;
+    uint64_t io_deferred;
 } server_ctx_t;
 
 int64_t monotonic_ms(void);
 int set_nonblocking(int fd);
 int set_cloexec(int fd);
-int server_init(server_ctx_t *srv, uint16_t port, const char *doc_root);
+int server_init(server_ctx_t *srv, uint16_t port, const char *doc_root, size_t cache_frames, size_t io_jobs);
 int server_run_event_loop(server_ctx_t *srv, volatile sig_atomic_t *stop_flag);
 void server_close(server_ctx_t *srv);
 

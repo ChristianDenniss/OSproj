@@ -100,9 +100,10 @@ def free_port():
 class ServerProcess:
     """Runs ./webshell against a document root and collects its output on stop."""
 
-    def __init__(self, doc_root, cwd):
+    def __init__(self, doc_root, cwd, extra_args=()):
         self.doc_root = doc_root
         self.cwd = cwd
+        self.extra_args = list(extra_args)
         self.port = free_port()
         self.proc = None
         self.stdout = ""
@@ -110,7 +111,7 @@ class ServerProcess:
 
     def start(self):
         self.proc = subprocess.Popen(
-            [BINARY, "-p", str(self.port), "-r", self.doc_root],
+            [BINARY, "-p", str(self.port), "-r", self.doc_root] + self.extra_args,
             cwd=self.cwd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -163,5 +164,11 @@ def make_fixture_tree():
 
 
 def sanitizer_problems(stderr):
-    markers = ("ERROR: AddressSanitizer", "ERROR: LeakSanitizer", "runtime error:", "SUMMARY: UndefinedBehavior")
+    markers = (
+        "ERROR: AddressSanitizer",
+        "ERROR: LeakSanitizer",
+        "WARNING: ThreadSanitizer",
+        "runtime error:",
+        "SUMMARY: UndefinedBehavior",
+    )
     return [line for line in stderr.splitlines() if any(m in line for m in markers)]

@@ -4,7 +4,8 @@
  * Student ID: 3729509
  *
  * Extends the Lab 07 poll(2) server with an explicit per-connection state
- * machine, page-by-page streaming of file bodies, persistent and pipelined
+ * machine, page-by-page streaming of file bodies through the page cache,
+ * file I/O delegated to a background worker, persistent and pipelined
  * requests, and bounded per-iteration work so no client can starve others.
  */
 
@@ -14,6 +15,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <stdio.h>
 #include <string.h>
@@ -78,6 +80,7 @@ static void reset_response(client_conn_t *c)
     }
     c->status = 0;
     c->send_body = false;
+    c->page_miss_pending = false;
     c->hdr_len = 0;
     c->hdr_sent = 0;
     c->body_total = 0;
@@ -87,6 +90,11 @@ static void reset_response(client_conn_t *c)
     c->stage_sent = 0;
 }
 
+/*
+ * If a worker job is still in flight for this connection, the job keeps
+ * ownership of any file descriptor it holds; the completion handler sees the
+ * connection is gone and closes it there.
+ */
 static void close_client(server_ctx_t *srv, client_conn_t *c)
 {
     reset_response(c);
@@ -97,9 +105,10 @@ static void close_client(server_ctx_t *srv, client_conn_t *c)
         srv->active_clients--;
     }
     c->drive_pending = false;
+    c->io_in_flight = false;
 }
 
-int server_init(server_ctx_t *srv, uint16_t port, const char *doc_root)
+int server_init(server_ctx_t *srv, uint16_t port, const char *doc_root, size_t cache_frames, size_t io_jobs)
 {
     memset(srv, 0, sizeof(*srv));
     srv->port = port;
@@ -157,6 +166,22 @@ int server_init(server_ctx_t *srv, uint16_t port, const char *doc_root)
         return -1;
     }
 
+    if (cache_init(&srv->cache, cache_frames) < 0)
+    {
+        fprintf(stderr, "webshell: cannot allocate %zu cache frames\n", cache_frames);
+        server_close(srv);
+        return -1;
+    }
+    srv->cache_ready = true;
+
+    srv->worker_ready = true;
+    if (io_worker_start(&srv->worker, srv->root_fd, io_jobs) < 0)
+    {
+        perror("webshell: start I/O worker");
+        server_close(srv);
+        return -1;
+    }
+
     srv->start_ms = monotonic_ms();
     return 0;
 }
@@ -191,6 +216,14 @@ static void accept_clients(server_ctx_t *srv, int64_t now)
             close(client_fd);
             continue;
         }
+
+        /*
+         * Headers and body pages go out as separate sends. Without
+         * TCP_NODELAY, Nagle's algorithm holds the second small segment until
+         * the client's delayed ACK (about 40 ms) on every keep-alive request.
+         */
+        int one = 1;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
         client_conn_t *c = NULL;
         for (int i = 0; i < MAX_CLIENTS; i++)
@@ -262,7 +295,7 @@ static void start_error_response(client_conn_t *c, int status, bool keep_alive)
     c->state = CONN_STATE_SENDING_HEADERS;
 }
 
-static void start_response(server_ctx_t *srv, client_conn_t *c)
+static void start_response(client_conn_t *c)
 {
     http_request_t *req = &c->request;
     if (req->method == HTTP_UNSUPPORTED)
@@ -271,17 +304,7 @@ static void start_response(server_ctx_t *srv, client_conn_t *c)
         return;
     }
 
-    char path[MAX_PATH_LEN + 16];
-    int status = http_decode_path(req->target, path, sizeof(path));
-    if (status != 0)
-    {
-        start_error_response(c, status, req->keep_alive);
-        return;
-    }
-
-    int fd = -1;
-    struct stat st;
-    status = http_open_file(srv->root_fd, path, &fd, &st);
+    int status = http_decode_path(req->target, c->path, sizeof(c->path));
     if (status != 0)
     {
         start_error_response(c, status, req->keep_alive);
@@ -289,14 +312,22 @@ static void start_response(server_ctx_t *srv, client_conn_t *c)
     }
 
     reset_response(c);
-    c->file_fd = fd;
-    c->status = 200;
     c->keep_alive = req->keep_alive;
-    c->send_body = req->method == HTTP_GET;
-    c->body_total = (uint64_t)st.st_size;
+    c->state = CONN_STATE_WAIT_FILE;
+}
 
-    int hdr_len = http_format_header(c->hdr_buf, sizeof(c->hdr_buf), 200, http_mime_type(path), c->body_total,
-                                     c->keep_alive);
+/* Takes ownership of fd, which the worker opened for this request. */
+static void begin_file_response(client_conn_t *c, int fd, const struct stat *st)
+{
+    reset_response(c);
+    c->file_fd = fd;
+    file_id_from_stat(&c->file, st);
+    c->status = 200;
+    c->send_body = c->request.method == HTTP_GET;
+    c->body_total = (uint64_t)st->st_size;
+
+    int hdr_len = http_format_header(c->hdr_buf, sizeof(c->hdr_buf), 200, http_mime_type(c->path),
+                                     c->body_total, c->keep_alive);
     if (hdr_len < 0)
     {
         start_error_response(c, 500, false);
@@ -306,35 +337,45 @@ static void start_response(server_ctx_t *srv, client_conn_t *c)
     c->state = CONN_STATE_SENDING_HEADERS;
 }
 
-/* Fills the staging buffer with the next page of the file body. */
-static int load_next_page(client_conn_t *c)
+static bool submit_open(server_ctx_t *srv, client_conn_t *c)
 {
-    uint64_t remaining = c->body_total - c->body_loaded;
-    size_t want = remaining < WS_PAGE_SIZE ? (size_t)remaining : WS_PAGE_SIZE;
-    size_t got = 0;
-
-    while (got < want)
+    io_job_t *job = io_job_acquire(&srv->worker);
+    if (job == NULL)
     {
-        ssize_t n = pread(c->file_fd, c->stage + got, want - got, (off_t)(c->body_loaded + got));
-        if (n > 0)
-        {
-            got += (size_t)n;
-        }
-        else if (n < 0 && errno == EINTR)
-        {
-            continue;
-        }
-        else
-        {
-            /* Read error or the file shrank after the headers promised its length. */
-            return -1;
-        }
+        srv->io_deferred++;
+        return false;
     }
+    job->type = IO_JOB_OPEN;
+    job->client_slot = (int)(c - srv->clients);
+    job->generation = c->generation;
+    memcpy(job->path, c->path, sizeof(job->path));
+    c->io_in_flight = true;
+    io_worker_submit(&srv->worker, job);
+    return true;
+}
 
-    c->stage_len = got;
-    c->stage_sent = 0;
-    c->body_loaded += got;
-    return 0;
+static bool submit_read(server_ctx_t *srv, client_conn_t *c, uint64_t page_index, size_t length)
+{
+    io_job_t *job = io_job_acquire(&srv->worker);
+    if (job == NULL)
+    {
+        srv->io_deferred++;
+        return false;
+    }
+    job->type = IO_JOB_READ;
+    job->client_slot = (int)(c - srv->clients);
+    job->generation = c->generation;
+    job->cache_epoch = srv->cache.epoch;
+    job->file = c->file;
+    job->page_index = page_index;
+    job->length = length;
+
+    /* The job owns the descriptor until its completion hands it back. */
+    job->fd = c->file_fd;
+    c->file_fd = -1;
+    c->io_in_flight = true;
+    io_worker_submit(&srv->worker, job);
+    return true;
 }
 
 /* Returns true if the connection stays open for another request. */
@@ -357,8 +398,8 @@ static bool finish_transaction(server_ctx_t *srv, client_conn_t *c)
 
 /*
  * Advances one connection as far as it can go without blocking. Called when
- * its socket is readable or writable, and again later if it still has a
- * buffered pipelined request after using up its per-call quota.
+ * its socket is readable or writable, when a worker job for it completes,
+ * and again later if it still has queued work after using up its quota.
  */
 static void client_drive(server_ctx_t *srv, client_conn_t *c, int64_t now)
 {
@@ -386,9 +427,18 @@ static void client_drive(server_ctx_t *srv, client_conn_t *c, int64_t now)
             }
             else
             {
-                start_response(srv, c);
+                start_response(c);
             }
             break;
+        }
+
+        case CONN_STATE_WAIT_FILE:
+        {
+            if (!c->io_in_flight)
+            {
+                submit_open(srv, c);
+            }
+            return;
         }
 
         case CONN_STATE_SENDING_HEADERS:
@@ -422,18 +472,36 @@ static void client_drive(server_ctx_t *srv, client_conn_t *c, int64_t now)
 
         case CONN_STATE_WAIT_PAGE:
         {
-            if (load_next_page(c) < 0)
-            {
-                /* Headers are already out, so the only safe signal is closing. */
-                close_client(srv, c);
-                return;
-            }
-            c->state = CONN_STATE_SENDING_BODY;
-            if (++pages >= PAGES_PER_DRIVE)
+            if (c->io_in_flight)
             {
                 return;
             }
-            break;
+            uint64_t page_index = c->body_loaded / WS_PAGE_SIZE;
+            uint64_t remaining = c->body_total - c->body_loaded;
+            size_t want = remaining < WS_PAGE_SIZE ? (size_t)remaining : WS_PAGE_SIZE;
+
+            size_t got = 0;
+            if (!c->page_miss_pending && cache_lookup(&srv->cache, &c->file, page_index, c->stage, &got))
+            {
+                if (got != want)
+                {
+                    close_client(srv, c);
+                    return;
+                }
+                c->stage_len = got;
+                c->stage_sent = 0;
+                c->body_loaded += got;
+                c->state = CONN_STATE_SENDING_BODY;
+                if (++pages >= PAGES_PER_DRIVE)
+                {
+                    return;
+                }
+                break;
+            }
+
+            /* Remember the miss so a deferred retry is not counted twice. */
+            c->page_miss_pending = !submit_read(srv, c, page_index, want);
+            return;
         }
 
         case CONN_STATE_SENDING_BODY:
@@ -471,6 +539,83 @@ static void client_drive(server_ctx_t *srv, client_conn_t *c, int64_t now)
     }
 }
 
+static void handle_completion(server_ctx_t *srv, io_job_t *job, int64_t now)
+{
+    client_conn_t *c = &srv->clients[job->client_slot];
+    bool live = c->fd != -1 && c->generation == job->generation && c->io_in_flight;
+
+    if (job->type == IO_JOB_OPEN)
+    {
+        if (!live)
+        {
+            if (job->fd != -1)
+            {
+                close(job->fd);
+            }
+        }
+        else
+        {
+            c->io_in_flight = false;
+            if (job->status != 0)
+            {
+                start_error_response(c, job->status, c->keep_alive);
+            }
+            else
+            {
+                begin_file_response(c, job->fd, &job->st);
+            }
+        }
+    }
+    else
+    {
+        /* Pages read before a flush carry the old epoch and are not cached. */
+        if (!job->failed && job->cache_epoch == srv->cache.epoch)
+        {
+            cache_insert(&srv->cache, &job->file, job->page_index, job->data, job->length);
+        }
+
+        if (!live)
+        {
+            close(job->fd);
+        }
+        else
+        {
+            c->io_in_flight = false;
+            c->file_fd = job->fd;
+            if (job->failed)
+            {
+                /* Headers are already out, so the only safe signal is closing. */
+                close_client(srv, c);
+                live = false;
+            }
+            else
+            {
+                memcpy(c->stage, job->data, job->length);
+                c->stage_len = job->length;
+                c->stage_sent = 0;
+                c->body_loaded += job->length;
+                c->state = CONN_STATE_SENDING_BODY;
+            }
+        }
+    }
+
+    io_job_release(&srv->worker, job);
+    if (live)
+    {
+        client_drive(srv, c, now);
+    }
+}
+
+static void process_completions(server_ctx_t *srv, int64_t now)
+{
+    io_job_t *done[IO_JOB_CAPACITY];
+    size_t count = io_worker_take_completions(&srv->worker, done);
+    for (size_t i = 0; i < count; i++)
+    {
+        handle_completion(srv, done[i], now);
+    }
+}
+
 static void handle_readable(server_ctx_t *srv, client_conn_t *c, int64_t now)
 {
     size_t space = sizeof(c->rx_buf) - c->rx_len;
@@ -498,6 +643,7 @@ static void handle_readable(server_ctx_t *srv, client_conn_t *c, int64_t now)
     }
 }
 
+/* Only ask for POLLOUT when bytes are actually waiting to be sent. */
 static short client_poll_events(const client_conn_t *c)
 {
     switch (c->state)
@@ -512,12 +658,26 @@ static short client_poll_events(const client_conn_t *c)
     }
 }
 
+static bool client_waiting_for_job(const client_conn_t *c)
+{
+    return (c->state == CONN_STATE_WAIT_FILE || c->state == CONN_STATE_WAIT_PAGE) && !c->io_in_flight;
+}
+
+static bool client_needs_retry(const server_ctx_t *srv, const client_conn_t *c)
+{
+    if (c->drive_pending)
+    {
+        return true;
+    }
+        return client_waiting_for_job(c) && io_jobs_in_use(&srv->worker) < srv->worker.job_limit;
+}
+
 static void expire_idle_clients(server_ctx_t *srv, int64_t now)
 {
     for (int i = 0; i < MAX_CLIENTS; i++)
     {
         client_conn_t *c = &srv->clients[i];
-        if (c->fd != -1 && now - c->last_active_ms >= CLIENT_TIMEOUT_MS)
+        if (c->fd != -1 && !c->io_in_flight && now - c->last_active_ms >= CLIENT_TIMEOUT_MS)
         {
             close_client(srv, c);
         }
@@ -526,9 +686,9 @@ static void expire_idle_clients(server_ctx_t *srv, int64_t now)
 
 int server_run_event_loop(server_ctx_t *srv, volatile sig_atomic_t *stop_flag)
 {
-    struct pollfd fds[MAX_CLIENTS + 1];
-    int slot_of[MAX_CLIENTS + 1];
-    uint32_t generation_of[MAX_CLIENTS + 1];
+    struct pollfd fds[MAX_CLIENTS + 2];
+    int slot_of[MAX_CLIENTS + 2];
+    uint32_t generation_of[MAX_CLIENTS + 2];
 
     while (!*stop_flag)
     {
@@ -537,7 +697,14 @@ int server_run_event_loop(server_ctx_t *srv, volatile sig_atomic_t *stop_flag)
 
         nfds_t nfds = 0;
         int listen_index = -1;
-        bool any_pending = false;
+        bool retry_needed = false;
+
+        fds[nfds].fd = srv->worker.notify_read_fd;
+        fds[nfds].events = POLLIN;
+        fds[nfds].revents = 0;
+        int notify_index = (int)nfds;
+        nfds++;
+
         if (srv->active_clients < MAX_CLIENTS && now >= srv->accept_resume_ms)
         {
             fds[nfds].fd = srv->listen_fd;
@@ -547,6 +714,7 @@ int server_run_event_loop(server_ctx_t *srv, volatile sig_atomic_t *stop_flag)
             nfds++;
         }
 
+        int first_client = (int)nfds;
         for (int i = 0; i < MAX_CLIENTS; i++)
         {
             client_conn_t *c = &srv->clients[i];
@@ -560,10 +728,11 @@ int server_run_event_loop(server_ctx_t *srv, volatile sig_atomic_t *stop_flag)
             slot_of[nfds] = i;
             generation_of[nfds] = c->generation;
             nfds++;
-            any_pending = any_pending || c->drive_pending;
+            retry_needed = retry_needed || client_needs_retry(srv, c);
         }
 
-        int timeout = any_pending ? 0 : POLL_TIMEOUT_MS;
+        /* Waiting for a free job needs no timeout: a completion wakes the loop. */
+        int timeout = retry_needed ? 0 : POLL_TIMEOUT_MS;
         if (listen_index < 0 && srv->accept_resume_ms > now && srv->accept_resume_ms - now < timeout)
         {
             timeout = (int)(srv->accept_resume_ms - now);
@@ -581,12 +750,13 @@ int server_run_event_loop(server_ctx_t *srv, volatile sig_atomic_t *stop_flag)
         }
 
         now = monotonic_ms();
-        for (nfds_t j = 0; j < nfds; j++)
+        if (fds[notify_index].revents & POLLIN)
         {
-            if ((int)j == listen_index)
-            {
-                continue;
-            }
+            process_completions(srv, now);
+        }
+
+        for (nfds_t j = (nfds_t)first_client; j < nfds; j++)
+        {
             client_conn_t *c = &srv->clients[slot_of[j]];
             short revents = fds[j].revents;
             if (revents == 0 || c->fd == -1 || c->generation != generation_of[j])
@@ -612,10 +782,11 @@ int server_run_event_loop(server_ctx_t *srv, volatile sig_atomic_t *stop_flag)
             }
         }
 
+        /* Connections deferred for lack of a free worker job, or out of quota. */
         for (int i = 0; i < MAX_CLIENTS; i++)
         {
             client_conn_t *c = &srv->clients[i];
-            if (c->fd != -1 && c->drive_pending)
+            if (c->fd != -1 && client_needs_retry(srv, c))
             {
                 c->drive_pending = false;
                 client_drive(srv, c, now);
@@ -634,9 +805,33 @@ int server_run_event_loop(server_ctx_t *srv, volatile sig_atomic_t *stop_flag)
 
 void server_close(server_ctx_t *srv)
 {
+    if (srv->worker_ready)
+    {
+        /* The worker finishes queued jobs; their descriptors are closed here. */
+        io_worker_stop(&srv->worker);
+        io_job_t *done[IO_JOB_CAPACITY];
+        size_t count = io_worker_take_completions(&srv->worker, done);
+        for (size_t i = 0; i < count; i++)
+        {
+            if (done[i]->fd != -1)
+            {
+                close(done[i]->fd);
+            }
+            io_job_release(&srv->worker, done[i]);
+        }
+        io_worker_destroy(&srv->worker);
+        srv->worker_ready = false;
+    }
+
     for (int i = 0; i < MAX_CLIENTS; i++)
     {
         close_client(srv, &srv->clients[i]);
+    }
+
+    if (srv->cache_ready)
+    {
+        cache_destroy(&srv->cache);
+        srv->cache_ready = false;
     }
 
     if (srv->listen_fd != -1)

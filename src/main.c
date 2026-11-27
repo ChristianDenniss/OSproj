@@ -50,31 +50,56 @@ static int install_signal_handlers(void)
 
 static void usage(const char *prog)
 {
-    fprintf(stderr, "usage: %s [-p port] [-r document_root]\n", prog);
+    fprintf(stderr, "usage: %s [-p port] [-r document_root] [-c cache_frames] [-j io_jobs]\n", prog);
+}
+
+static int parse_count(const char *text, unsigned long min, unsigned long max, size_t *out)
+{
+    char *end = NULL;
+    unsigned long value = strtoul(text, &end, 10);
+    if (end == text || *end != '\0' || value < min || value > max)
+    {
+        return -1;
+    }
+    *out = (size_t)value;
+    return 0;
 }
 
 int main(int argc, char *argv[])
 {
     uint16_t port = DEFAULT_PORT;
     const char *doc_root = DEFAULT_DOC_ROOT;
+    size_t cache_frames = CACHE_DEFAULT_FRAMES;
+    size_t io_jobs = IO_JOB_CAPACITY;
+    size_t value = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "p:r:h")) != -1)
+    while ((opt = getopt(argc, argv, "p:r:c:j:h")) != -1)
     {
         switch (opt)
         {
+        case 'c':
+            if (parse_count(optarg, 1, CACHE_MAX_FRAMES, &cache_frames) < 0)
+            {
+                fprintf(stderr, "webshell: cache frames must be between 1 and %d\n", CACHE_MAX_FRAMES);
+                return 1;
+            }
+            break;
+        case 'j':
+            if (parse_count(optarg, 1, IO_JOB_CAPACITY, &io_jobs) < 0)
+            {
+                fprintf(stderr, "webshell: I/O jobs must be between 1 and %d\n", IO_JOB_CAPACITY);
+                return 1;
+            }
+            break;
         case 'p':
-        {
-            char *end = NULL;
-            unsigned long value = strtoul(optarg, &end, 10);
-            if (end == optarg || *end != '\0' || value < 1024 || value > 65535)
+            if (parse_count(optarg, 1024, 65535, &value) < 0)
             {
                 fprintf(stderr, "webshell: port must be an unprivileged port (1024-65535)\n");
                 return 1;
             }
             port = (uint16_t)value;
             break;
-        }
         case 'r':
             doc_root = optarg;
             break;
@@ -93,18 +118,26 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (server_init(&server, port, doc_root) < 0)
+    if (server_init(&server, port, doc_root, cache_frames, io_jobs) < 0)
     {
         return 1;
     }
 
-    printf("[webshell] Listening on http://0.0.0.0:%u (document root: %s)\n", port, doc_root);
+    printf("[webshell] Listening on http://0.0.0.0:%u (document root: %s, cache: %zu x %d-byte frames)\n",
+           port, doc_root, cache_frames, WS_PAGE_SIZE);
     fflush(stdout);
 
     int rc = server_run_event_loop(&server, &stop_requested);
+
+    uint64_t hits = server.cache.hits;
+    uint64_t misses = server.cache.misses;
+    uint64_t evictions = server.cache.evictions;
     server_close(&server);
 
-    printf("[webshell] Stopped. Requests served: %llu, bytes sent: %llu\n",
-           (unsigned long long)server.requests_served, (unsigned long long)server.bytes_sent);
+    printf("[webshell] Stopped. requests=%llu bytes=%llu cache_hits=%llu cache_misses=%llu "
+           "cache_evictions=%llu io_deferred=%llu send_would_block=%llu\n",
+           (unsigned long long)server.requests_served, (unsigned long long)server.bytes_sent,
+           (unsigned long long)hits, (unsigned long long)misses, (unsigned long long)evictions,
+           (unsigned long long)server.io_deferred, (unsigned long long)server.send_would_block);
     return rc == 0 ? 0 : 1;
 }

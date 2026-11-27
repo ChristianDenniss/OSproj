@@ -19,6 +19,7 @@
 #define REQ_BUF_SIZE 8192
 #define MAX_PATH_LEN 512
 #define MAX_METHOD_LEN 16
+#define DECODED_PATH_LEN (MAX_PATH_LEN + 16)
 
 typedef enum
 {

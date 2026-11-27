@@ -38,7 +38,11 @@ build/release/%.o: src/%.c | build/release
 build/debug build/release:
 	mkdir -p $@
 
-test: webshell
+build/debug/cache_test: tests/cache_test.c build/debug/cache.o | build/debug
+	$(CC) $(CFLAGS) -Isrc tests/cache_test.c build/debug/cache.o $(LDFLAGS) -o $@
+
+test: webshell build/debug/cache_test
+	./build/debug/cache_test
 	python3 -m unittest discover -s tests -p 'test_*.py' -v
 
 clean:
