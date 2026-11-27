@@ -97,6 +97,16 @@ static void reset_response(client_conn_t *c)
  */
 static void close_client(server_ctx_t *srv, client_conn_t *c)
 {
+    /* An aborted transaction is still logged, with the body bytes actually sent. */
+    if (c->log_reserved)
+    {
+        uint64_t body = c->body_sent + (c->state == CONN_STATE_SENDING_BODY ? c->stage_sent : 0);
+        logger_append(&srv->log, c->peer_ip, c->request.method_name, c->request.target, c->status,
+                      c->send_body ? body : 0);
+        c->log_reserved = false;
+    }
+    c->waiting_for_log = false;
+
     reset_response(c);
     if (c->fd != -1)
     {
@@ -108,13 +118,17 @@ static void close_client(server_ctx_t *srv, client_conn_t *c)
     c->io_in_flight = false;
 }
 
-int server_init(server_ctx_t *srv, uint16_t port, const char *doc_root, size_t cache_frames, size_t io_jobs)
+int server_init(server_ctx_t *srv, const server_config_t *config)
 {
     memset(srv, 0, sizeof(*srv));
+    uint16_t port = config->port;
+    const char *doc_root = config->doc_root;
     srv->port = port;
     srv->doc_root = doc_root;
     srv->listen_fd = -1;
     srv->root_fd = -1;
+    srv->log.fd = -1;
+    shell_init(&srv->shell, STDIN_FILENO);
 
     for (int i = 0; i < MAX_CLIENTS; i++)
     {
@@ -166,16 +180,24 @@ int server_init(server_ctx_t *srv, uint16_t port, const char *doc_root, size_t c
         return -1;
     }
 
-    if (cache_init(&srv->cache, cache_frames) < 0)
+    if (cache_init(&srv->cache, config->cache_frames) < 0)
     {
-        fprintf(stderr, "webshell: cannot allocate %zu cache frames\n", cache_frames);
+        fprintf(stderr, "webshell: cannot allocate %zu cache frames\n", config->cache_frames);
         server_close(srv);
         return -1;
     }
     srv->cache_ready = true;
 
+    if (logger_open(&srv->log, config->log_path, config->log_capacity) < 0)
+    {
+        fprintf(stderr, "webshell: cannot open access log '%s': %s\n", config->log_path, strerror(errno));
+        server_close(srv);
+        return -1;
+    }
+    srv->log_ready = true;
+
     srv->worker_ready = true;
-    if (io_worker_start(&srv->worker, srv->root_fd, io_jobs) < 0)
+    if (io_worker_start(&srv->worker, srv->root_fd, config->io_jobs) < 0)
     {
         perror("webshell: start I/O worker");
         server_close(srv);
@@ -382,6 +404,10 @@ static bool submit_read(server_ctx_t *srv, client_conn_t *c, uint64_t page_index
 static bool finish_transaction(server_ctx_t *srv, client_conn_t *c)
 {
     srv->requests_served++;
+    logger_append(&srv->log, c->peer_ip, c->request.method_name, c->request.target, c->status,
+                  c->send_body ? c->body_total : 0);
+    c->log_reserved = false;
+
     if (!c->keep_alive)
     {
         close_client(srv, c);
@@ -421,6 +447,24 @@ static void client_drive(server_ctx_t *srv, client_conn_t *c, int64_t now)
             {
                 return;
             }
+            if (srv->draining)
+            {
+                /* No new requests are admitted once shutdown has begun. */
+                close_client(srv, c);
+                return;
+            }
+            if (!logger_reserve(&srv->log))
+            {
+                /* Log ring full: leave the request buffered until a flush frees space. */
+                if (!c->waiting_for_log)
+                {
+                    srv->log_deferred++;
+                }
+                c->waiting_for_log = true;
+                return;
+            }
+            c->waiting_for_log = false;
+            c->log_reserved = true;
             if (result == PARSE_FAILED)
             {
                 start_error_response(c, c->request.error_status, false);
@@ -539,8 +583,58 @@ static void client_drive(server_ctx_t *srv, client_conn_t *c, int64_t now)
     }
 }
 
+static void finish_log_batch(server_ctx_t *srv, io_job_t *job)
+{
+    bool ok = job->log_error == 0;
+    if (!ok)
+    {
+        shell_printf("[log] writing %zu record(s) to access.log failed: %s\n", job->log_count,
+                     strerror(job->log_error));
+    }
+    logger_end_batch(&srv->log, ok);
+    io_job_release(&srv->worker, job);
+}
+
+/*
+ * Hands waiting log records to the worker every LOG_FLUSH_INTERVAL_MS, or
+ * sooner once the ring is half full. Only one batch is in flight at a time.
+ */
+static void start_log_flush(server_ctx_t *srv, int64_t now)
+{
+    access_log_t *log = &srv->log;
+    if (log->in_flight > 0 || log->count == 0)
+    {
+        return;
+    }
+    if (now < log->next_flush_ms && log->count * 2 < log->limit)
+    {
+        return;
+    }
+    io_job_t *job = io_log_job_acquire(&srv->worker);
+    if (job == NULL)
+    {
+        return;
+    }
+    size_t start = 0;
+    size_t count = 0;
+    logger_begin_batch(log, &start, &count);
+    job->log_fd = log->fd;
+    job->log_ring = log->records;
+    job->log_limit = log->limit;
+    job->log_start = start;
+    job->log_count = count;
+    io_worker_submit(&srv->worker, job);
+    log->next_flush_ms = now + LOG_FLUSH_INTERVAL_MS;
+}
+
 static void handle_completion(server_ctx_t *srv, io_job_t *job, int64_t now)
 {
+    if (job->type == IO_JOB_LOG)
+    {
+        finish_log_batch(srv, job);
+        return;
+    }
+
     client_conn_t *c = &srv->clients[job->client_slot];
     bool live = c->fd != -1 && c->generation == job->generation && c->io_in_flight;
 
@@ -608,7 +702,7 @@ static void handle_completion(server_ctx_t *srv, io_job_t *job, int64_t now)
 
 static void process_completions(server_ctx_t *srv, int64_t now)
 {
-    io_job_t *done[IO_JOB_CAPACITY];
+    io_job_t *done[IO_QUEUE_CAPACITY];
     size_t count = io_worker_take_completions(&srv->worker, done);
     for (size_t i = 0; i < count; i++)
     {
@@ -621,8 +715,8 @@ static void handle_readable(server_ctx_t *srv, client_conn_t *c, int64_t now)
     size_t space = sizeof(c->rx_buf) - c->rx_len;
     if (space == 0)
     {
-        start_error_response(c, 431, false);
-        client_drive(srv, c, now);
+        /* Unreachable in practice: a full buffer is rejected with 431 by the parser. */
+        close_client(srv, c);
         return;
     }
 
@@ -649,7 +743,7 @@ static short client_poll_events(const client_conn_t *c)
     switch (c->state)
     {
     case CONN_STATE_READING_REQ:
-        return POLLIN;
+        return c->waiting_for_log ? 0 : POLLIN;
     case CONN_STATE_SENDING_HEADERS:
     case CONN_STATE_SENDING_BODY:
         return POLLOUT;
@@ -669,7 +763,11 @@ static bool client_needs_retry(const server_ctx_t *srv, const client_conn_t *c)
     {
         return true;
     }
-        return client_waiting_for_job(c) && io_jobs_in_use(&srv->worker) < srv->worker.job_limit;
+    if (c->waiting_for_log)
+    {
+        return logger_can_reserve(&srv->log);
+    }
+    return client_waiting_for_job(c) && io_jobs_in_use(&srv->worker) < srv->worker.job_limit;
 }
 
 static void expire_idle_clients(server_ctx_t *srv, int64_t now)
@@ -684,34 +782,124 @@ static void expire_idle_clients(server_ctx_t *srv, int64_t now)
     }
 }
 
-int server_run_event_loop(server_ctx_t *srv, volatile sig_atomic_t *stop_flag)
+void server_begin_shutdown(server_ctx_t *srv, const char *reason)
 {
-    struct pollfd fds[MAX_CLIENTS + 2];
-    int slot_of[MAX_CLIENTS + 2];
-    uint32_t generation_of[MAX_CLIENTS + 2];
+    if (srv->draining)
+    {
+        return;
+    }
+    srv->draining = true;
+    srv->drain_deadline_ms = monotonic_ms() + SHUTDOWN_DRAIN_MS;
 
-    while (!*stop_flag)
+    if (srv->listen_fd != -1)
+    {
+        close(srv->listen_fd);
+        srv->listen_fd = -1;
+    }
+
+    size_t idle_closed = 0;
+    for (int i = 0; i < MAX_CLIENTS; i++)
+    {
+        client_conn_t *c = &srv->clients[i];
+        if (c->fd == -1)
+        {
+            continue;
+        }
+        if (c->state == CONN_STATE_READING_REQ)
+        {
+            close_client(srv, c);
+            idle_closed++;
+        }
+        else
+        {
+            /* Finish the response in progress, then close instead of reading another. */
+            c->keep_alive = false;
+        }
+    }
+
+    shell_printf("[shutdown] %s: stopped accepting, closed %zu idle connection(s), draining %zu "
+                 "response(s) (deadline %d ms)\n",
+                 reason, idle_closed, srv->active_clients, SHUTDOWN_DRAIN_MS);
+}
+
+static void drain_signal_pipe(int fd)
+{
+    char sink[64];
+    while (read(fd, sink, sizeof(sink)) > 0)
+    {
+    }
+}
+
+static int min_timeout(int timeout, int64_t deadline, int64_t now)
+{
+    if (deadline <= now)
+    {
+        return 0;
+    }
+    return deadline - now < timeout ? (int)(deadline - now) : timeout;
+}
+
+int server_run_event_loop(server_ctx_t *srv, int signal_fd, volatile sig_atomic_t *stop_signals)
+{
+    struct pollfd fds[MAX_CLIENTS + 4];
+    int slot_of[MAX_CLIENTS + 4];
+    uint32_t generation_of[MAX_CLIENTS + 4];
+    sig_atomic_t signals_seen = 0;
+
+    for (;;)
     {
         int64_t now = monotonic_ms();
+
+        if (*stop_signals != signals_seen)
+        {
+            signals_seen = *stop_signals;
+            if (!srv->draining)
+            {
+                server_begin_shutdown(srv, "termination signal");
+            }
+            else if (signals_seen >= 2)
+            {
+                shell_printf("[shutdown] second signal: skipping the rest of the drain period\n");
+                srv->drain_deadline_ms = now;
+            }
+        }
+        if (srv->draining && (srv->active_clients == 0 || now >= srv->drain_deadline_ms))
+        {
+            break;
+        }
+
         expire_idle_clients(srv, now);
+        start_log_flush(srv, now);
 
         nfds_t nfds = 0;
-        int listen_index = -1;
         bool retry_needed = false;
 
         fds[nfds].fd = srv->worker.notify_read_fd;
         fds[nfds].events = POLLIN;
         fds[nfds].revents = 0;
-        int notify_index = (int)nfds;
-        nfds++;
+        int notify_index = (int)nfds++;
 
-        if (srv->active_clients < MAX_CLIENTS && now >= srv->accept_resume_ms)
+        fds[nfds].fd = signal_fd;
+        fds[nfds].events = POLLIN;
+        fds[nfds].revents = 0;
+        int signal_index = (int)nfds++;
+
+        int stdin_index = -1;
+        if (srv->shell.input_open)
+        {
+            fds[nfds].fd = srv->shell.input_fd;
+            fds[nfds].events = POLLIN;
+            fds[nfds].revents = 0;
+            stdin_index = (int)nfds++;
+        }
+
+        int listen_index = -1;
+        if (srv->listen_fd != -1 && srv->active_clients < MAX_CLIENTS && now >= srv->accept_resume_ms)
         {
             fds[nfds].fd = srv->listen_fd;
             fds[nfds].events = POLLIN;
             fds[nfds].revents = 0;
-            listen_index = (int)nfds;
-            nfds++;
+            listen_index = (int)nfds++;
         }
 
         int first_client = (int)nfds;
@@ -731,11 +919,19 @@ int server_run_event_loop(server_ctx_t *srv, volatile sig_atomic_t *stop_flag)
             retry_needed = retry_needed || client_needs_retry(srv, c);
         }
 
-        /* Waiting for a free job needs no timeout: a completion wakes the loop. */
+        /* Waiting for a free job or log slot needs no timer: a completion wakes the loop. */
         int timeout = retry_needed ? 0 : POLL_TIMEOUT_MS;
-        if (listen_index < 0 && srv->accept_resume_ms > now && srv->accept_resume_ms - now < timeout)
+        if (srv->listen_fd != -1 && listen_index < 0 && srv->accept_resume_ms > now)
         {
-            timeout = (int)(srv->accept_resume_ms - now);
+            timeout = min_timeout(timeout, srv->accept_resume_ms, now);
+        }
+        if (srv->log.count > 0 && srv->log.in_flight == 0)
+        {
+            timeout = min_timeout(timeout, srv->log.next_flush_ms, now);
+        }
+        if (srv->draining)
+        {
+            timeout = min_timeout(timeout, srv->drain_deadline_ms, now);
         }
 
         int ready = poll(fds, nfds, timeout);
@@ -750,9 +946,21 @@ int server_run_event_loop(server_ctx_t *srv, volatile sig_atomic_t *stop_flag)
         }
 
         now = monotonic_ms();
+        if (fds[signal_index].revents & POLLIN)
+        {
+            drain_signal_pipe(signal_fd);
+        }
+        if (srv->shell.child_count > 0)
+        {
+            shell_reap_children(srv);
+        }
         if (fds[notify_index].revents & POLLIN)
         {
             process_completions(srv, now);
+        }
+        if (stdin_index >= 0 && (fds[stdin_index].revents & (POLLIN | POLLHUP | POLLERR)))
+        {
+            shell_handle_input(srv);
         }
 
         for (nfds_t j = (nfds_t)first_client; j < nfds; j++)
@@ -782,7 +990,7 @@ int server_run_event_loop(server_ctx_t *srv, volatile sig_atomic_t *stop_flag)
             }
         }
 
-        /* Connections deferred for lack of a free worker job, or out of quota. */
+        /* Connections deferred for a worker job or log slot, or out of quota. */
         for (int i = 0; i < MAX_CLIENTS; i++)
         {
             client_conn_t *c = &srv->clients[i];
@@ -794,25 +1002,45 @@ int server_run_event_loop(server_ctx_t *srv, volatile sig_atomic_t *stop_flag)
         }
 
         /* Accept last so new descriptors never collide with this round's poll entries. */
-        if (listen_index >= 0 && (fds[listen_index].revents & POLLIN))
+        if (listen_index >= 0 && srv->listen_fd != -1 && (fds[listen_index].revents & POLLIN))
         {
             accept_clients(srv, now);
         }
     }
 
+    if (srv->active_clients > 0)
+    {
+        shell_printf("[shutdown] drain deadline reached; aborting %zu connection(s)\n", srv->active_clients);
+        for (int i = 0; i < MAX_CLIENTS; i++)
+        {
+            close_client(srv, &srv->clients[i]);
+        }
+    }
     return 0;
 }
 
+/*
+ * Teardown order matters: children first; then the worker, which finishes
+ * any queued file reads and log batch before it is joined; then connections
+ * (whose aborted transactions are logged); then a final synchronous log
+ * flush; and only then the descriptors and memory the worker was using.
+ */
 void server_close(server_ctx_t *srv)
 {
+    shell_terminate_children(srv);
+
     if (srv->worker_ready)
     {
-        /* The worker finishes queued jobs; their descriptors are closed here. */
         io_worker_stop(&srv->worker);
-        io_job_t *done[IO_JOB_CAPACITY];
+        io_job_t *done[IO_QUEUE_CAPACITY];
         size_t count = io_worker_take_completions(&srv->worker, done);
         for (size_t i = 0; i < count; i++)
         {
+            if (done[i]->type == IO_JOB_LOG)
+            {
+                finish_log_batch(srv, done[i]);
+                continue;
+            }
             if (done[i]->fd != -1)
             {
                 close(done[i]->fd);
@@ -826,6 +1054,26 @@ void server_close(server_ctx_t *srv)
     for (int i = 0; i < MAX_CLIENTS; i++)
     {
         close_client(srv, &srv->clients[i]);
+    }
+
+    if (srv->log_ready)
+    {
+        access_log_t *log = &srv->log;
+        if (log->count > 0)
+        {
+            char buf[WS_PAGE_SIZE];
+            size_t start = 0;
+            size_t count = 0;
+            logger_begin_batch(log, &start, &count);
+            int err = logger_write_records(log->fd, log->records, log->limit, start, count, buf, sizeof(buf));
+            if (err != 0)
+            {
+                shell_printf("[log] final flush of %zu record(s) failed: %s\n", count, strerror(err));
+            }
+            logger_end_batch(log, err == 0);
+        }
+        logger_close(log);
+        srv->log_ready = false;
     }
 
     if (srv->cache_ready)

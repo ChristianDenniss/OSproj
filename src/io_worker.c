@@ -76,23 +76,28 @@ static void *worker_main(void *arg)
             break;
         }
         int index = w->submit_ring[w->submit_head];
-        w->submit_head = (w->submit_head + 1) % IO_JOB_CAPACITY;
+        w->submit_head = (w->submit_head + 1) % IO_QUEUE_CAPACITY;
         w->submit_count--;
         pthread_mutex_unlock(&w->lock);
 
         /* The blocking work happens with no lock held. */
         io_job_t *job = &w->jobs[index];
-        if (job->type == IO_JOB_OPEN)
+        switch (job->type)
         {
+        case IO_JOB_OPEN:
             run_open_job(w, job);
-        }
-        else
-        {
+            break;
+        case IO_JOB_READ:
             run_read_job(job);
+            break;
+        case IO_JOB_LOG:
+            job->log_error = logger_write_records(job->log_fd, job->log_ring, job->log_limit, job->log_start,
+                                                  job->log_count, (char *)job->data, sizeof(job->data));
+            break;
         }
 
         pthread_mutex_lock(&w->lock);
-        w->done_ring[(w->done_head + w->done_count) % IO_JOB_CAPACITY] = index;
+        w->done_ring[(w->done_head + w->done_count) % IO_QUEUE_CAPACITY] = index;
         w->done_count++;
         pthread_mutex_unlock(&w->lock);
 
@@ -137,7 +142,7 @@ int io_worker_start(io_worker_t *w, int root_fd, size_t job_limit)
         job_limit = IO_JOB_CAPACITY;
     }
     w->job_limit = job_limit;
-    for (size_t i = 0; i < IO_JOB_CAPACITY; i++)
+    for (size_t i = 0; i < IO_QUEUE_CAPACITY; i++)
     {
         w->jobs[i].fd = -1;
     }
@@ -235,7 +240,26 @@ io_job_t *io_job_acquire(io_worker_t *w)
 
 void io_job_release(io_worker_t *w, io_job_t *job)
 {
+    if (job == &w->jobs[IO_JOB_CAPACITY])
+    {
+        w->log_job_busy = false;
+        return;
+    }
     w->free_stack[w->free_count++] = (int)(job - w->jobs);
+}
+
+io_job_t *io_log_job_acquire(io_worker_t *w)
+{
+    if (w->log_job_busy)
+    {
+        return NULL;
+    }
+    io_job_t *job = &w->jobs[IO_JOB_CAPACITY];
+    memset(job, 0, offsetof(io_job_t, data));
+    job->type = IO_JOB_LOG;
+    job->fd = -1;
+    w->log_job_busy = true;
+    return job;
 }
 
 size_t io_jobs_in_use(const io_worker_t *w)
@@ -246,13 +270,13 @@ size_t io_jobs_in_use(const io_worker_t *w)
 void io_worker_submit(io_worker_t *w, io_job_t *job)
 {
     pthread_mutex_lock(&w->lock);
-    w->submit_ring[(w->submit_head + w->submit_count) % IO_JOB_CAPACITY] = (int)(job - w->jobs);
+    w->submit_ring[(w->submit_head + w->submit_count) % IO_QUEUE_CAPACITY] = (int)(job - w->jobs);
     w->submit_count++;
     pthread_cond_signal(&w->work_ready);
     pthread_mutex_unlock(&w->lock);
 }
 
-size_t io_worker_take_completions(io_worker_t *w, io_job_t *out[IO_JOB_CAPACITY])
+size_t io_worker_take_completions(io_worker_t *w, io_job_t *out[IO_QUEUE_CAPACITY])
 {
     /*
      * Drain wakeups first. A completion pushed after this point writes a new
@@ -268,7 +292,7 @@ size_t io_worker_take_completions(io_worker_t *w, io_job_t *out[IO_JOB_CAPACITY]
     while (w->done_count > 0)
     {
         out[taken++] = &w->jobs[w->done_ring[w->done_head]];
-        w->done_head = (w->done_head + 1) % IO_JOB_CAPACITY;
+        w->done_head = (w->done_head + 1) % IO_QUEUE_CAPACITY;
         w->done_count--;
     }
     pthread_mutex_unlock(&w->lock);
